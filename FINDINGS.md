@@ -145,6 +145,22 @@ matrix lives in a different vector space. W_O wins marginally (+0.005 to
 The codebook win is **specific to MLP down-projection.** That covers
 ~33% of model parameters in Pythia. Other 2/3 must use standard quantization.
 
+### probe_k_sweep.py (sweep k_sparse on Pythia 410M L=12)
+
+| k | SAE relerr | Random | Gain | Bytes/matrix |
+|---|---|---|---|---|
+| 1 | 0.847 | 0.990 | +0.144 | 20 KB |
+| 2 | 0.824 | 0.982 | +0.158 | 33 KB |
+| 4 | 0.794 | 0.965 | +0.171 | 57 KB |
+| 8 | 0.751 | 0.935 | +0.184 | 106 KB |
+| 16 | 0.687 | 0.881 | +0.194 | 205 KB |
+| 32 | 0.595 | 0.785 | +0.190 | 401 KB |
+| 64 | 0.473 | 0.628 | +0.156 | 795 KB |
+
+The codebook gain (~15-19 pp) is consistent across all k_sparse values.
+Even at k=1 the SAE beats random by 14 pp — single atoms ARE meaningful.
+The gain peaks around k=16-32 and drops at k=64 where random catches up.
+
 ### probe_compression.py — the verdict
 
 End-to-end PPL test, all 24 mlp.dense_4h_to_h substituted with codebook
@@ -164,6 +180,28 @@ Why: per-matrix relerr ~0.55 looks like "preserving 45% of the matrix" but
 the relative L2 error compounds across 24 sequential matrix substitutions.
 The dominant subspace is preserved, but every fine direction is lost — and
 fine directions matter for token prediction.
+
+### probe_residual.py — the hybrid rescue (partial)
+
+If the codebook captures the "easy" directions and an INT4 quantized residual
+catches what the codebook misses, can the combination beat plain INT4?
+
+| Method | PPL | Delta | Bytes/matrix |
+|---|---|---|---|
+| Original FP32 | 19.49 | 0 | 16.8 MB |
+| INT4 per-row | 22.41 | +2.93 | 2.10 MB |
+| **Hybrid (codebook k=8 + INT4 resid)** | **20.49** | **+1.01** | **2.20 MB** |
+
+Hybrid PPL delta is **3× better** than INT4 at essentially the same per-matrix
+bytes (5% overhead from the small codebook codes). Per-matrix hybrid relerr
+dropped from 0.55 (codebook-only) to ~0.13 — the INT4 residual is doing the
+heavy lifting now, and the codebook contribution acts as a structural prior.
+
+**But the dictionary cost still dominates.** For Pythia 410M's 24 layers at
+INT4 dict storage: 24 × 16 MB = 384 MB of dictionaries just to encode
+~50 MB of MLP-down weights. Net bytes: worse than plain INT4. The hybrid only
+makes sense if you're already storing the dictionary for other reasons (e.g.,
+interpretability work).
 
 ---
 
