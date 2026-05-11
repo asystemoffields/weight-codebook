@@ -611,11 +611,12 @@ if HAVE_MODAL:
     _image = (
         _modal.Image.debian_slim(python_version="3.11")
         .pip_install(
+            "numpy<2.0",
             "torch==2.5.1",
-            "transformers>=4.46.0",
-            "huggingface_hub[hf_transfer]",
+            "transformers==4.46.3",
+            "huggingface_hub[hf_transfer]>=0.26,<1.0",
         )
-        .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+        .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONUNBUFFERED": "1"})
     )
     _vol = _modal.Volume.from_name("hf-cache-weight-codebook", create_if_missing=True)
     _app = _modal.App("kv-virtual-atoms-probe")
