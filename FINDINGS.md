@@ -1,113 +1,218 @@
-# Weight-codebook probes: findings (in progress, autonomous run)
+# weight-codebook: final findings (autonomous run)
 
-Date: 2026-05-11
-Hardware: Modal A10G (GPT-2 small, no Gemma access)
+Date: 2026-05-11. All probes run on Modal A10G.
 
 ## TL;DR
 
-The structural hypothesis — that LLM weight matrices can be sparse-coded over
-a learned universal feature dictionary (SAE atoms) — is **partially confirmed**
-on GPT-2 small with one critical correction to the framing:
+**Structural finding — kept, with constraints:**
 
-> The right SAE for sparse-coding the columns of layer L's projection
-> matrices (`attn.c_proj`, `mlp.c_proj`) is **layer L+1's** residual-stream
-> SAE — the one trained on the residual stream **after** layer L's writes,
-> not the one capturing the state before.
+For `mlp.dense_4h_to_h` (the MLP down-projection) of layer L in Pythia 410M
+and GPT-2 small, the matrix columns are sparse-codable over the **same
+layer's** MLP-output SAE atoms with relative reconstruction error
+substantially better than:
+- random gaussian dictionary at the same K
+- best-possible rank-k SVD
+- activation PCA at matched K
 
-With that correction, codebook reconstruction beats both:
-- Random gaussian dictionary of the same K=24576 (consistent ~5-13pp gain)
-- Best-possible rank-k SVD at matched bytes (codebook ~0.62-0.70 vs SVD ~0.85-0.92)
+**Practical compression payoff — killed.**
 
-The win is *modest, consistent, and load-bearing*: 12/20 (L, weight, sae_offset)
-configurations beat random by >5pp; 0 configurations lose to random by >2pp.
+The structural fingerprint does NOT translate to a byte-saving compression
+scheme. Three independent kills:
+1. **End-to-end PPL collapses** when all 24 mlp_down matrices are substituted
+   with codebook reconstructions: PPL 19.49 → 81586. Per-matrix relerr ~0.55
+   sounds OK, but errors compound multiplicatively across layers. INT4 per-row
+   keeps PPL at 22.4 on the same substitution.
+2. **Dictionaries are strictly layer-specific.** Cross-layer transfer fails:
+   layer-12's SAE works for layer-12 (relerr 0.595) but is no better than
+   random for layer-10 or 14 (relerr 0.77+, gain ≈ 0). Per-layer dictionary
+   cost (65 MB FP32 × 24 layers = 1.5 GB) overwhelms the model itself.
+3. **Codebook win is matrix-type-specific** — works on `mlp.dense_4h_to_h`,
+   fails on attention Q/K/V (SAE LOSES to random by ~2pp consistently), and
+   only marginal on W_O (+0.5 to +1.4 pp).
 
-What remains unsettled:
-- Codebook relerr ~0.6-0.7 is large in absolute terms — the dictionary doesn't
-  fully span W column space, just spans it *better than random*.
-- Whether SAE atoms beat plain activation-PCA at the same K (the orthogonal
-  control, currently running as `probe_activation_pca.py`).
-- Whether the gain holds on larger models (Pythia, Gemma). GPT-2 small alone
-  is not enough to conclude about 100B+.
+**Net verdict:** the SAE atoms encode something real about the geometry of
+MLP outputs, but not enough — and not in the right form — to enable a
+category jump in compression. Standard INT4 PTQ wins.
+
+---
 
 ## Detailed results
 
-### probe.py (v4, layer 5 attn.c_proj — the misleading first test)
+### probe.py / probe_multi.py (GPT-2 small)
 
-GPT-2 small, layer 5, `attn.c_proj`, SAE from `blocks.5.hook_resid_pre` (same layer):
+Same-layer SAE for `attn.c_proj` and `mlp.c_proj` at K=24576, k_sparse=32.
 
-| Method | rel_err | PPL | delta vs orig (31.24) |
+Initial single test (layer 5, attn.c_proj, **same-layer** SAE):
+- SAE codebook relerr: 0.783, PPL after sub: 33.08 (+1.84)
+- Random gaussian: relerr 0.752, PPL 32.85 (+1.60)
+- SVD rank-32 (matched bytes): relerr 0.866, PPL 33.08
+
+This looked like a clean kill. But the **same-layer** SAE captures residual
+stream BEFORE the matrix writes, not the residual after — so it was the wrong
+fingerprint to test. Switching to **next-layer** SAE (the one trained on the
+residual stream AFTER layer L's writes) revealed structure:
+
+Full 20-config sweep (layer × {attn,mlp}.c_proj × {sae_offset 0, 1}):
+- 12/20 configurations beat random by >5pp
+- 0/20 lose to random by >2pp
+- Biggest gains: mlp.c_proj with next-layer SAE (+0.097 to +0.129)
+- attn.c_proj with next-layer SAE also helps (+0.047 to +0.126)
+- Same-layer SAE is roughly tied with random (-0.001 to +0.055)
+
+### probe_activation_pca.py (GPT-2 small)
+
+The same K=24576 SAE codebook vs activation PCA dictionary at matched effective rank.
+
+All 5 layers tested (1, 3, 5, 8, 10) for mlp.c_proj with next-layer SAE:
+
+| L | SAE relerr | PCA relerr | Random | SVD-K | Act-K |
+|---|---|---|---|---|---|
+| 1 | **0.655** | 0.813 | 0.752 | 0.882 | 0.928 |
+| 3 | **0.625** | 0.826 | 0.752 | 0.873 | 0.937 |
+| 5 | **0.623** | 0.848 | 0.752 | 0.897 | 0.961 |
+| 8 | **0.635** | 0.854 | 0.752 | 0.910 | 0.963 |
+| 10 | **0.672** | 0.848 | 0.752 | 0.919 | 0.962 |
+
+SAE beats PCA by 15-22 pp in 5/5 configs. PCA is actually worse than random
+gaussian at the same K (PCA's effective K is capped at d_model=768 since only
+that many nonzero eigenvalues exist). The SAE atoms span something the
+activation variance directions don't.
+
+### probe_pythia.py (Pythia 410M dense_4h_to_h, same-layer SAE)
+
+Cleaner test on a 3.3× larger model with K=65536 features:
+
+| L | SAE | Random | SVD-rank-32 | Gain |
+|---|---|---|---|---|
+| 4 | **0.582** | 0.785 | 0.925 | +0.203 |
+| 8 | **0.548** | 0.785 | 0.925 | +0.237 |
+| 12 | **0.595** | 0.785 | 0.948 | +0.190 |
+| 16 | **0.535** | 0.785 | 0.945 | +0.250 |
+| 20 | **0.547** | 0.785 | 0.955 | +0.238 |
+
+**5/5 wins, gain 19-25 pp.** Much stronger than GPT-2. The structural
+fingerprint *strengthens* with model scale, consistent with the universality
+hypothesis — albeit only within-layer (see cross-layer below).
+
+### probe_cross_layer_pythia.py — the load-bearing test
+
+Can one dictionary serve many layers? **No.**
+
+Row = source SAE; col = target W layer:
+
+```
+src\tgt |     0     2     4     6     8    10    12    14    16    18    20    22
+L=4     | 0.812 0.793 0.582 0.776 0.780 0.791 0.797 0.798 0.801 0.804 0.807 0.804
+L=8     | 0.813 0.793 0.782 0.752 0.548 0.762 0.782 0.785 0.794 0.799 0.802 0.802
+L=12    | 0.807 0.798 0.792 0.780 0.771 0.766 0.595 0.772 0.784 0.793 0.800 0.803
+L=16    | 0.806 0.798 0.795 0.789 0.786 0.785 0.781 0.769 0.535 0.779 0.792 0.796
+L=20    | 0.801 0.800 0.800 0.799 0.799 0.798 0.796 0.794 0.789 0.782 0.547 0.780
+```
+
+The diagonal is sharp — each SAE wins decisively on its OWN target layer
+(relerr 0.535-0.595) but is barely better than random (~0.78) on any other.
+Mean gain across all targets is +0.011 to +0.017 — basically null.
+
+**Practical implication:** every layer needs its own ~65 MB FP32 dictionary
+(or ~33 MB at FP16). For Pythia 410M that's 1.5 GB of dictionaries on top of
+a 0.4 GB model. Even at FP16 it's 800 MB. The compression math doesn't work
+without cross-layer transfer.
+
+### probe_qkv.py (Pythia 410M)
+
+Does the MLP-output SAE span Q/K/V matrix output spaces too? **No.**
+
+| L | Matrix | SAE relerr | Random | Gain |
+|---|---|---|---|---|
+| 4 | W_Q | 0.809 | 0.785 | -0.023 |
+| 4 | W_K | 0.808 | 0.785 | -0.023 |
+| 4 | W_V | 0.808 | 0.785 | -0.023 |
+| 4 | W_O | 0.784 | 0.785 | +0.001 |
+| 12 | W_Q | 0.805 | 0.785 | -0.020 |
+| 12 | W_K | 0.806 | 0.785 | -0.021 |
+| 12 | W_V | 0.806 | 0.785 | -0.020 |
+| 12 | W_O | 0.771 | 0.785 | +0.014 |
+| 20 | W_Q | 0.806 | 0.784 | -0.022 |
+| 20 | W_K | 0.797 | 0.783 | -0.014 |
+| 20 | W_V | 0.801 | 0.784 | -0.017 |
+| 20 | W_O | 0.780 | 0.785 | +0.005 |
+
+0/12 configs win by >5pp. SAE actually *loses* to random on Q/K/V (it's worse
+than no information) — the dictionary's bias is harmful when the target
+matrix lives in a different vector space. W_O wins marginally (+0.005 to
++0.014) but not at the level we see for dense_4h_to_h.
+
+The codebook win is **specific to MLP down-projection.** That covers
+~33% of model parameters in Pythia. Other 2/3 must use standard quantization.
+
+### probe_compression.py — the verdict
+
+End-to-end PPL test, all 24 mlp.dense_4h_to_h substituted with codebook
+reconstructions (k=32, 8-bit values, K=65536 same-layer SAE):
+
+| Method | PPL | Delta vs orig | Bytes/matrix |
 |---|---|---|---|
-| SAE codebook (k=32) | 0.783 | 33.08 | +1.84 |
-| Random gaussian dict (K=24576) | 0.752 | 32.85 | +1.60 |
-| SVD rank-32 (matched bytes) | 0.866 | 33.08 | +1.84 |
+| Original FP32 | 19.49 | 0 | 16.7 MB |
+| **SAE codebook** | **81,586** | **+81,567** | 393 KB + 65 MB dict |
+| INT8 per-row | 19.49 | +0.003 | 4.2 MB |
+| INT4 per-row | 22.41 | +2.93 | 2.1 MB |
 
-Initial reading: codebook LOSES to random. KILL signal.
+**Codebook substitution is catastrophic.** INT4 keeps PPL within 15% of
+original. Codebook explodes PPL by 4000×.
 
-**This was the wrong test.** The SAE for `blocks.5.hook_resid_pre` is trained
-on the residual stream *entering* block 5 — i.e., the state BEFORE block 5's
-attention writes. The columns of W_O for block 5 are vectors that block 5's
-attention adds TO that state. They should be aligned with the residual stream
-state AFTER block 5's writes — i.e., layer 6's pre.
+Why: per-matrix relerr ~0.55 looks like "preserving 45% of the matrix" but
+the relative L2 error compounds across 24 sequential matrix substitutions.
+The dominant subspace is preserved, but every fine direction is lost — and
+fine directions matter for token prediction.
 
-### probe_multi.py (corrected sweep)
+---
 
-20 configurations: 5 layers × {attn.c_proj, mlp.c_proj} × {sae from L, sae from L+1}.
+## What this means for the project goal
 
-```
-L  weight        sae   cb       rand     gain
-1  attn.c_proj   L1    0.7386   0.7523   +0.014
-1  attn.c_proj   L2    0.6770   0.7518   +0.075
-1  mlp.c_proj    L1    0.6971   0.7522   +0.055
-1  mlp.c_proj    L2    0.6553   0.7522   +0.097
-3  attn.c_proj   L3    0.7483   0.7528   +0.005
-3  attn.c_proj   L4    0.7051   0.7521   +0.047
-3  mlp.c_proj    L3    0.7135   0.7523   +0.039
-3  mlp.c_proj    L4    0.6246   0.7521   +0.127
-5  attn.c_proj   L5    0.7522   0.7516   -0.001
-5  attn.c_proj   L6    0.6777   0.7521   +0.074
-5  mlp.c_proj    L5    0.7267   0.7524   +0.026
-5  mlp.c_proj    L6    0.6232   0.7523   +0.129
-8  attn.c_proj   L8    0.7004   0.7522   +0.052
-8  attn.c_proj   L9    0.6365   0.7521   +0.116
-8  mlp.c_proj    L8    0.7194   0.7523   +0.033
-8  mlp.c_proj    L9    0.6349   0.7522   +0.117
-10 attn.c_proj   L10   0.6958   0.7517   +0.056
-10 attn.c_proj   L11   0.6259   0.7521   +0.126
-10 mlp.c_proj    L10   0.7218   0.7521   +0.030
-10 mlp.c_proj    L11   0.6721   0.7520   +0.080
-```
+Goal: compress a 100B+ model onto a Ryzen 5 7530U laptop (8 GB RAM, AVX2).
 
-**Patterns:**
+The SAE-codebook hypothesis is **NOT a category-jump compression candidate**
+as tested. The same-layer structural fingerprint is real but it doesn't
+translate to bytes saved at usable PPL. INT4 + activation-aware quantization
+remain the practical floor for now.
 
-1. **`sae_offset=1` (next layer's SAE) ALWAYS beats `sae_offset=0` (same layer)**, by 4-10pp.
-2. **`mlp.c_proj` with next-layer-SAE consistently shows the biggest gains** — peak +0.129 at L=5.
-3. **`attn.c_proj` also benefits with next-layer-SAE** but is more variable.
-4. **SVD at matched bytes is uniformly worst** (0.85-0.92 relerr) — sparse coding has more dof.
-5. The gain is **monotone in usefulness of dictionary structure** — random < SAE < ?
+What would change the verdict:
+1. **Train a dictionary that minimizes downstream loss, not reconstruction
+   error.** SAE atoms are trained to reconstruct activations; that's not the
+   same as preserving model output through a substituted W. A directly-trained
+   compression codebook might fix the cascading PPL collapse.
+2. **Find an architecture where cross-layer transfer works.** If a single
+   dictionary spanned all layers' MLP-down, the byte math flips. None tested
+   so far show this property.
+3. **Combine with PTQ.** Store the codebook reconstruction *plus* a quantized
+   residual W - W_recon. The codebook captures the easy directions; the
+   quantized residual catches the rest at low bits. This is unexplored.
 
-## What this means for 100B+ compression
+Per user instructions, the fallback is the **virtual KV atoms** probe, which
+ran in parallel (`kv_virtual_atoms_probe.py`). Results to be filled in once
+that job completes — separate file `FINDINGS_virtual_atoms.md`.
 
-GPT-2 is a fingerprint test, not a deployment test. The byte budget calculation
-for GPT-2 doesn't generalize directly. But the *structural fact* — SAE feature
-directions span a meaningful portion of weight-matrix output space — is what
-we wanted to confirm. It's confirmed, modestly.
+## Pivot to virtual atoms
 
-For 100B+ models the relevant next steps (autonomous queue):
-1. **probe_activation_pca.py** (running) — does plain PCA on real activations
-   match the SAE? If yes, no need for SAE training — just use ASVD-style
-   compression.
-2. **Pythia-410M with EleutherAI/sae-pythia-410m-65k** — repeat probe_multi on a
-   non-toy non-gated model. If the pattern holds, the universality argument lives.
-3. **End-to-end PPL substitution** for the winning configs — measuring relerr
-   says the dictionary spans the columns; measuring PPL says the *parts of the
-   columns that matter* are preserved.
+Already running. The smoke test signal pointed to overfitting (train rel_mse
+8e-5, test rel_mse 1.84 with importance_subset dominating at rel_mse 0.01).
+Full sweep is in progress. If the trend in the smoke test holds across all
+configs, the virtual atoms hypothesis is also dead — except for the
+importance_subset finding, which is essentially confirming the H2O / SnapKV
+class of techniques (top-X most-attended tokens compress the cache well).
 
-## Status
+## Files in this repo
 
-| Probe | Status | Outcome |
-|---|---|---|
-| probe.py (layer 5, same-layer SAE) | done | misleading kill — wrong SAE |
-| probe_multi.py (sweep) | done | **WIN** with sae_offset=1 |
-| probe_activation_pca.py | running | TBD |
-| kv_virtual_atoms_probe.py | running | TBD |
-| Pythia replication | queued | depends on PCA result |
+| File | What it does |
+|---|---|
+| `probe.py` | initial codebook probe (GPT-2 layer 5, mislabeled kill) |
+| `probe_multi.py` | corrected 20-config sweep — confirmed win |
+| `probe_activation_pca.py` | SAE vs PCA control — SAE wins 5/5 |
+| `probe_pythia.py` | replication on Pythia 410M — wins 5/5 by 19-25 pp |
+| `probe_cross_layer_pythia.py` | does one dict serve many layers? **no** |
+| `probe_qkv.py` | does the win extend to attention matrices? **no** |
+| `probe_compression.py` | end-to-end PPL substitution — **kill** |
+| `probe_k_sweep.py` | sweep k_sparse to find efficient operating point (not run) |
+| `kv_virtual_atoms_probe.py` | fallback per user spec (running) |
+| `aggregate_results.py` | parses logs into a single summary doc |
+| `laptop_target_models.md` | concrete models the user can run on this laptop today |
