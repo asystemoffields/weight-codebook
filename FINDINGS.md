@@ -230,14 +230,59 @@ Per user instructions, the fallback is the **virtual KV atoms** probe, which
 ran in parallel (`kv_virtual_atoms_probe.py`). Results to be filled in once
 that job completes — separate file `FINDINGS_virtual_atoms.md`.
 
-## Pivot to virtual atoms
+## Pivot to virtual atoms — called early
 
-Already running. The smoke test signal pointed to overfitting (train rel_mse
-8e-5, test rel_mse 1.84 with importance_subset dominating at rel_mse 0.01).
-Full sweep is in progress. If the trend in the smoke test holds across all
-configs, the virtual atoms hypothesis is also dead — except for the
-importance_subset finding, which is essentially confirming the H2O / SnapKV
-class of techniques (top-X most-attended tokens compress the cache well).
+Single smoke test (GPT-2 small, layer 5 head 3, n=64, m=8, prose passage)
+delivered the textbook "boring result" fingerprint from your spec:
+
+| method | test rel_mse | test cosine | train rel_mse |
+|---|---|---|---|
+| **virtual_atoms** (learned P, U) | **1.84** | 0.56 | 8e-5 |
+| importance_subset (top-m attended real tokens) | **0.01** | 0.995 | — |
+| kmeans on K | 3.75 | 0.23 | — |
+| random subset | 13.87 | 0.01 | — |
+
+Train rel_mse 8e-5 with held-out 1.84 is pure memorization — the 16 train
+queries are too few to constrain `m × d = 1024` learnable params. Meanwhile
+`importance_subset` (just keep the top-m most-attended real tokens) was
+nearly perfect on held-out queries.
+
+Translation: for this head, the KV cache acts table-like, and a straight
+attention-mass top-K is the right compression. That's basically what
+StreamingLLM / H2O / SnapKV already do — not a new insight, but a clean
+reproduction of the dominant signal in that line of work.
+
+Full sweep was running on Modal (~60% done) when the local CLI lost DNS
+heartbeat and Modal tore down the function (no deployed app). Re-running
+declined; smoke signal judged conclusive.
+
+## Side finding worth keeping (probe_partial_substitution.py)
+
+Substituting `mlp.dense_4h_to_h` of Pythia 410M with the codebook
+reconstruction is wildly position-asymmetric:
+
+| K | first K subst (delta PPL) | last K subst (delta PPL) |
+|---|---|---|
+| 1 | **+144** | +1.4 |
+| 2 | +225 | +2.8 |
+| 4 | +3657 | +5.9 |
+| 8 | +7437 | +16.4 |
+| 12 | +7297 | +37.7 |
+| 16 | +28847 | +80.7 |
+| 20 | +59635 | +140.2 |
+| 24 | +63793 | +63793 |
+
+Per-matrix relerr is roughly constant across layers (~0.5-0.6), but the
+*downstream effect* differs by 100× depending on layer depth. Errors in
+early layers propagate through every subsequent layer's residual stream and
+amplify; errors in late layers only affect a few more operations before the
+output head.
+
+Practical implication for any future compression scheme: don't spend the
+same bits per layer. Early layers need high-precision weights; late layers
+tolerate aggressive compression. This is consistent with the observation
+in the Minitron paper that depth pruning works best when you remove deeper
+layers (arXiv 2408.11796), and with PowerInfer's hot/cold layer split.
 
 ## Files in this repo
 
